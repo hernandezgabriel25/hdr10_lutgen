@@ -44,6 +44,14 @@
 #define FALLBACK_MIN_NITS    0.005f
 #define MAX_SCAN_FRAMES       500     /* Frames decoded to hunt for metadata*/
 
+/* ── Validation constants ── */
+#define VAL_FRAMES          20        /* Number of frames to sample         */
+#define VAL_PIXEL_STEP      16        /* Sample every Nth pixel (x and y)   */
+#define VAL_HIST_BINS       12        /* Histogram buckets for output luma  */
+#define VAL_MAX_SAMPLES   2000000     /* Max luma samples for percentiles   */
+#define VAL_WHITE_CLIP_THRESH 0.997f
+#define VAL_BLACK_CLIP_THRESH 0.003f
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * HDR10 metadata bag
  * ═══════════════════════════════════════════════════════════════════════════*/
@@ -117,22 +125,80 @@ static void mat3_mul(const float M[3][3], float r, float g, float b,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * libplacebo tone-mapping wrapper (CPU path)
+ * Pixel extraction: 10-bit YCbCr → PQ-encoded RGB [0,1]
  *
- * pl_tone_map_sample(x, params) maps a single luminance value.
- * x        – input luminance in nits  [0, input_max]
- * returns  – output luminance in nits [0, output_max]
+ * Supports YUV420P10LE, YUV422P10LE, YUV444P10LE.
+ * Assumes BT.2020 limited-range (standard for HDR10).
+ *
+ * Returns 0 on success, -1 if format unsupported.
+ * ═══════════════════════════════════════════════════════════════════════════*/
+static int frame_get_pq_rgb(const AVFrame *frm, int x, int y,
+                             float *r, float *g, float *b)
+{
+    int fmt = frm->format;
+    if (fmt != AV_PIX_FMT_YUV420P10LE &&
+        fmt != AV_PIX_FMT_YUV422P10LE &&
+        fmt != AV_PIX_FMT_YUV444P10LE)
+        return -1;
+
+    int Y_stride  = frm->linesize[0] / 2;
+    int UV_stride = frm->linesize[1] / 2;
+
+    /* Chroma pixel coordinates based on subsampling */
+    int cx = x, cy = y;
+    if (fmt == AV_PIX_FMT_YUV420P10LE) { cx = x >> 1; cy = y >> 1; }
+    else if (fmt == AV_PIX_FMT_YUV422P10LE) { cx = x >> 1; }
+
+    const uint16_t *Yp  = (const uint16_t *)frm->data[0];
+    const uint16_t *Cbp = (const uint16_t *)frm->data[1];
+    const uint16_t *Crp = (const uint16_t *)frm->data[2];
+
+    int Yv  = Yp [y  * Y_stride  + x];
+    int Cbv = Cbp[cy * UV_stride + cx];
+    int Crv = Crp[cy * UV_stride + cx];
+
+    /* BT.2020 10-bit limited-range normalisation:
+     *   Y  : [64, 940] → [0, 1]
+     *   Cb,Cr: [64, 960] → [-0.5, +0.5]  (offset 512 = zero) */
+    float Yn  = ((float)Yv  -  64.0f) / 876.0f;
+    float Pbn = ((float)Cbv - 512.0f) / 896.0f;
+    float Prn = ((float)Crv - 512.0f) / 896.0f;
+
+    /* ITU-R BT.2020 YCbCr → PQ-encoded R'G'B'
+     *   Kr=0.2627, Kg=0.6780, Kb=0.0593
+     *   R = Y + 1.4746*Pr
+     *   B = Y + 1.8814*Pb
+     *   G = (Y - Kr*R - Kb*B) / Kg                */
+    float R = Yn + 1.4746f * Prn;
+    float B = Yn + 1.8814f * Pbn;
+    float G = (Yn - 0.2627f * R - 0.0593f * B) / 0.6780f;
+
+    *r = fmaxf(0.0f, fminf(1.0f, R));
+    *g = fmaxf(0.0f, fminf(1.0f, G));
+    *b = fmaxf(0.0f, fminf(1.0f, B));
+    return 0;
+}
+
+/* qsort comparator for float ascending */
+static int cmp_float_asc(const void *a, const void *b)
+{
+    float fa = *(const float *)a;
+    float fb = *(const float *)b;
+    return (fa > fb) - (fa < fb);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * libplacebo tone-mapping wrapper (CPU path)
  * ═══════════════════════════════════════════════════════════════════════════*/
 static struct pl_tone_map_params build_tm_params(const HDRMeta *hdr)
 {
     struct pl_tone_map_params p = {0};
-    p.function   = &pl_tone_map_bt2390;   /* ITU-R BT.2390 EETF             */
+    p.function   = &pl_tone_map_bt2390;
     p.input_max  = hdr->peak_nits;
     p.input_min  = hdr->min_nits;
-    p.output_max = SDR_REF_WHITE;          /* 203 nit reference white        */
+    p.output_max = SDR_REF_WHITE;
     p.output_min = 0.0f;
 
-    /* Pass static HDR10 metadata so the function can adapt */
     p.hdr.max_luma = hdr->peak_nits;
     p.hdr.min_luma = hdr->min_nits;
     p.hdr.max_cll  = hdr->max_cll;
@@ -169,16 +235,14 @@ static void convert_sample(float ri, float gi, float bi,
     /* 5. Scale RGB by the luminance ratio (preserves hue/saturation) */
     float scale = (Y > 0.001f) ? (Y_sdr / Y) : 0.0f;
 
-    /* 6. Apply luminance-preserving highlight desaturation
-     *    (blend towards white in the SDR range – matches BT.2390 intent) */
-    float sdr_luma_norm = Y_sdr / tm->output_max;   /* normalised [0,1] */
-    float desat = fmaxf(0.0f, (sdr_luma_norm - 0.8f) / 0.2f); /* 0..1 */
+    /* 6. Apply luminance-preserving highlight desaturation */
+    float sdr_luma_norm = Y_sdr / tm->output_max;
+    float desat = fmaxf(0.0f, (sdr_luma_norm - 0.8f) / 0.2f);
 
     float rn = r709 * scale / tm->output_max;
     float gn = g709 * scale / tm->output_max;
     float bn = b709 * scale / tm->output_max;
 
-    /* Blend towards SDR luma white on overexposed highlights */
     rn = rn + desat * (sdr_luma_norm - rn);
     gn = gn + desat * (sdr_luma_norm - gn);
     bn = bn + desat * (sdr_luma_norm - bn);
@@ -194,7 +258,6 @@ static void convert_sample(float ri, float gi, float bi,
  * ═══════════════════════════════════════════════════════════════════════════*/
 static void extract_from_stream(AVStream *st, HDRMeta *meta)
 {
-    /* Mastering display metadata from stream side-data */
     const AVPacketSideData *sd = av_packet_side_data_get(
                                     st->codecpar->coded_side_data,
                                     st->codecpar->nb_coded_side_data,
@@ -209,7 +272,6 @@ static void extract_from_stream(AVStream *st, HDRMeta *meta)
         }
     }
 
-    /* MaxCLL / MaxFALL */
     sd = av_packet_side_data_get(st->codecpar->coded_side_data,
                                   st->codecpar->nb_coded_side_data,
                                   AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
@@ -224,7 +286,6 @@ static void extract_from_stream(AVStream *st, HDRMeta *meta)
 
 static void extract_from_frame(AVFrame *frame, HDRMeta *meta)
 {
-    /* Mastering display */
     AVFrameSideData *sd = av_frame_get_side_data(frame,
                               AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
     if (sd && !meta->have_mastering) {
@@ -236,7 +297,6 @@ static void extract_from_frame(AVFrame *frame, HDRMeta *meta)
         }
     }
 
-    /* MaxCLL */
     sd = av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
     if (sd && !meta->have_cll) {
         AVContentLightMetadata *clm = (AVContentLightMetadata *)sd->data;
@@ -263,7 +323,6 @@ static int scan_video(const char *path, HDRMeta *meta)
         return -1;
     }
 
-    /* Find first video stream */
     int vidx = av_find_best_stream(fctx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     if (vidx < 0) {
         fprintf(stderr, "No video stream found\n");
@@ -277,10 +336,8 @@ static int scan_video(const char *path, HDRMeta *meta)
            av_get_pix_fmt_name(vst->codecpar->format),
            vst->codecpar->width, vst->codecpar->height);
 
-    /* Try to grab metadata from stream side-data first */
     extract_from_stream(vst, meta);
 
-    /* Open decoder and scan frames only if still missing metadata */
     if (!meta->have_mastering || !meta->have_cll) {
         const AVCodec *codec = avcodec_find_decoder(vst->codecpar->codec_id);
         if (!codec) {
@@ -324,7 +381,6 @@ decode_done:
 done:
     avformat_close_input(&fctx);
 
-    /* Apply fallbacks */
     if (!meta->have_mastering) {
         fprintf(stderr,
                 "[warn] No mastering display metadata found — "
@@ -337,11 +393,274 @@ done:
         meta->max_cll  = meta->peak_nits;
         meta->max_fall = meta->peak_nits * 0.5f;
     }
-    /* Use MaxCLL as effective peak if it's lower (more accurate) */
     if (meta->max_cll > 1.0f && meta->max_cll < meta->peak_nits)
         meta->peak_nits = meta->max_cll;
 
     return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * LUT Validation Pass
+ *
+ * Decodes VAL_FRAMES frames spread across the video, samples every
+ * VAL_PIXEL_STEP-th pixel, and:
+ *   1. Measures real scene luminance (nits) percentiles.
+ *   2. Applies the full LUT pipeline to sampled pixels.
+ *   3. Reports output histogram, black/white clipping percentages, mean luma.
+ *   4. Auto-adjusts meta->peak_nits if the measured p99.9 is significantly
+ *      below the declared metadata value (inaccurate HDR10 metadata).
+ * ═══════════════════════════════════════════════════════════════════════════*/
+static void validate_and_adjust(const char *path, HDRMeta *meta)
+{
+    printf("\n[validate] Opening video for LUT accuracy validation...\n");
+
+    AVFormatContext *fctx = NULL;
+    if (avformat_open_input(&fctx, path, NULL, NULL) < 0) {
+        fprintf(stderr, "[validate] Cannot open video — skipping validation\n");
+        return;
+    }
+    avformat_find_stream_info(fctx, NULL);
+    int vidx = av_find_best_stream(fctx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    if (vidx < 0) { avformat_close_input(&fctx); return; }
+    AVStream *vst = fctx->streams[vidx];
+
+    const AVCodec *codec = avcodec_find_decoder(vst->codecpar->codec_id);
+    if (!codec) { avformat_close_input(&fctx); return; }
+
+    AVCodecContext *cctx = avcodec_alloc_context3(codec);
+    avcodec_parameters_to_context(cctx, vst->codecpar);
+    cctx->thread_count  = 4;
+    cctx->skip_frame    = AVDISCARD_NONKEY;   /* keyframes only → fast  */
+    if (avcodec_open2(cctx, codec, NULL) < 0) {
+        avcodec_free_context(&cctx);
+        avformat_close_input(&fctx);
+        return;
+    }
+
+    /* Build tone-map params from the metadata as-is (pre-adjustment) */
+    struct pl_tone_map_params tm = build_tm_params(meta);
+
+    /* Storage for luminance samples (for percentile computation) */
+    float *luma_buf = malloc(VAL_MAX_SAMPLES * sizeof(float));
+    if (!luma_buf) {
+        avcodec_free_context(&cctx);
+        avformat_close_input(&fctx);
+        return;
+    }
+
+    long   total_px   = 0;
+    long   black_clip = 0;
+    long   white_clip = 0;
+    long   luma_n     = 0;
+    double sum_out    = 0.0;
+    long   hist[VAL_HIST_BINS] = {0};
+    int    warned_fmt = 0;
+    int    frames_done = 0;
+
+    int64_t dur = fctx->duration;   /* in AV_TIME_BASE units */
+
+    AVPacket *pkt = av_packet_alloc();
+    AVFrame  *frm = av_frame_alloc();
+
+    for (int fi = 0; fi < VAL_FRAMES; fi++) {
+        /* Seek to evenly-spaced positions across the video              */
+        if (dur > 0) {
+            double frac = (VAL_FRAMES > 1)
+                          ? (double)fi / (VAL_FRAMES - 1) : 0.0;
+            int64_t target = av_rescale_q((int64_t)(frac * dur),
+                                          AV_TIME_BASE_Q, vst->time_base);
+            av_seek_frame(fctx, vidx, target, AVSEEK_FLAG_BACKWARD);
+            avcodec_flush_buffers(cctx);
+        }
+
+        int got = 0;
+        while (!got && av_read_frame(fctx, pkt) >= 0) {
+            if (pkt->stream_index != vidx) { av_packet_unref(pkt); continue; }
+            if (avcodec_send_packet(cctx, pkt) == 0) {
+                while (avcodec_receive_frame(cctx, frm) == 0 && !got) {
+                    int fmt = frm->format;
+                    if (fmt != AV_PIX_FMT_YUV420P10LE &&
+                        fmt != AV_PIX_FMT_YUV422P10LE &&
+                        fmt != AV_PIX_FMT_YUV444P10LE) {
+                        if (!warned_fmt) {
+                            fprintf(stderr,
+                                "[validate] Pixel format '%s' not supported "
+                                "(need 10-bit YUV) — skipping validation\n",
+                                av_get_pix_fmt_name(fmt));
+                            warned_fmt = 1;
+                        }
+                        av_frame_unref(frm);
+                        continue;
+                    }
+
+                    int w = frm->width, h = frm->height;
+                    for (int py = 0; py < h; py += VAL_PIXEL_STEP) {
+                        for (int px = 0; px < w; px += VAL_PIXEL_STEP) {
+                            float ri, gi, bi;
+                            if (frame_get_pq_rgb(frm, px, py,
+                                                 &ri, &gi, &bi) < 0)
+                                continue;
+
+                            /* ── Scene luminance in nits (BT.709 gamut) ── */
+                            float lr = pq_eotf(ri);
+                            float lg = pq_eotf(gi);
+                            float lb = pq_eotf(bi);
+                            float r9, g9, b9;
+                            mat3_mul(M_2020_709, lr, lg, lb, &r9, &g9, &b9);
+                            float Y_in = 0.2126f*r9 + 0.7152f*g9 + 0.0722f*b9;
+
+                            if (luma_n < VAL_MAX_SAMPLES)
+                                luma_buf[luma_n++] = Y_in;
+
+                            /* ── Apply full LUT pipeline ──────────────── */
+                            float ro, go, bo;
+                            convert_sample(ri, gi, bi, &ro, &go, &bo, &tm);
+                            float Y_out = 0.2126f*ro + 0.7152f*go + 0.0722f*bo;
+
+                            sum_out += Y_out;
+                            total_px++;
+
+                            if (ro < VAL_BLACK_CLIP_THRESH &&
+                                go < VAL_BLACK_CLIP_THRESH &&
+                                bo < VAL_BLACK_CLIP_THRESH)
+                                black_clip++;
+
+                            if (ro > VAL_WHITE_CLIP_THRESH ||
+                                go > VAL_WHITE_CLIP_THRESH ||
+                                bo > VAL_WHITE_CLIP_THRESH)
+                                white_clip++;
+
+                            int bin = (int)(Y_out * VAL_HIST_BINS);
+                            if (bin < 0) bin = 0;
+                            if (bin >= VAL_HIST_BINS) bin = VAL_HIST_BINS - 1;
+                            hist[bin]++;
+                        }
+                    }
+                    got = 1;
+                    frames_done++;
+                    av_frame_unref(frm);
+                }
+            }
+            av_packet_unref(pkt);
+        }
+
+        printf("\r[validate] Sampled frame %2d / %d ...",
+               fi + 1, VAL_FRAMES);
+        fflush(stdout);
+    }
+    printf("\n");
+
+    av_frame_free(&frm);
+    av_packet_free(&pkt);
+    avcodec_free_context(&cctx);
+    avformat_close_input(&fctx);
+
+    if (total_px == 0 || luma_n == 0) {
+        fprintf(stderr, "[validate] No pixels sampled — skipping report\n");
+        free(luma_buf);
+        return;
+    }
+
+    /* ── Percentiles of scene luminance ──────────────────────────────── */
+    qsort(luma_buf, luma_n, sizeof(float), cmp_float_asc);
+    float p50  = luma_buf[(long)(luma_n * 0.500)];
+    float p90  = luma_buf[(long)(luma_n * 0.900)];
+    float p99  = luma_buf[(long)(luma_n * 0.990)];
+    float p999 = luma_buf[(long)(luma_n * 0.999)];
+    float pmax = luma_buf[luma_n - 1];
+    free(luma_buf);
+
+    double mean_out    = sum_out / total_px;
+    double pct_black   = 100.0 * black_clip / total_px;
+    double pct_white   = 100.0 * white_clip / total_px;
+
+    /* ── Print report ─────────────────────────────────────────────────── */
+    printf("\n");
+    printf("┌──────────────────────────────────────────────────────────────┐\n");
+    printf("│                    LUT Validation Report                     │\n");
+    printf("├──────────────────────────────────────────────────────────────┤\n");
+    printf("│  Frames sampled : %-4d    Pixels sampled : %-14ld  │\n",
+           frames_done, total_px);
+    printf("│                                                              │\n");
+    printf("│  Scene luminance (measured from real pixels, BT.709 nits):  │\n");
+    printf("│    Median (p50)    : %8.2f nits                         │\n", (double)p50);
+    printf("│    p90             : %8.2f nits                         │\n", (double)p90);
+    printf("│    p99             : %8.2f nits                         │\n", (double)p99);
+    printf("│    p99.9           : %8.2f nits  ← effective peak       │\n", (double)p999);
+    printf("│    Absolute max    : %8.2f nits                         │\n", (double)pmax);
+    printf("│    Metadata peak   : %8.2f nits                         │\n", (double)meta->peak_nits);
+    printf("│                                                              │\n");
+    printf("│  LUT output statistics (sRGB gamma-encoded signal):         │\n");
+    printf("│    Mean luma       :   %.4f  (%.1f%% of SDR range)       │\n",
+           mean_out, mean_out * 100.0);
+    printf("│    Black clipping  :   %5.2f%% of pixels clipped to 0      │\n", pct_black);
+    printf("│    White clipping  :   %5.2f%% of pixels clipped to 1      │\n", pct_white);
+    printf("│                                                              │\n");
+    printf("│  Output luma histogram (sRGB gamma, 0%%..100%%):             │\n");
+
+    /* Draw ASCII histogram bars */
+    for (int b = 0; b < VAL_HIST_BINS; b++) {
+        float pct = 100.0f * (float)hist[b] / (float)total_px;
+        int bar = (int)(pct / 2.0f);    /* 2% per █, max 25 chars */
+        if (bar > 25) bar = 25;
+        printf("│   %3.0f%%–%3.0f%%  [",
+               100.0f * b / VAL_HIST_BINS,
+               100.0f * (b + 1) / VAL_HIST_BINS);
+        for (int k = 0; k < bar; k++)       printf("█");
+        for (int k = bar; k < 25; k++)      printf(" ");
+        printf("] %5.1f%%  │\n", (double)pct);
+    }
+    printf("└──────────────────────────────────────────────────────────────┘\n\n");
+
+    /* ── Diagnostics ──────────────────────────────────────────────────── */
+    int issues = 0;
+
+    if (pct_white > 2.0) {
+        fprintf(stderr,
+            "[validate] WARNING: %.1f%% of pixels clip to white. "
+            "Tone mapping is overexposed (peak_nits too low?).\n", pct_white);
+        issues++;
+    }
+    if (pct_black > 10.0) {
+        fprintf(stderr,
+            "[validate] WARNING: %.1f%% of pixels clip to black. "
+            "Shadow detail may be crushed.\n", pct_black);
+        issues++;
+    }
+    if (mean_out < 0.08) {
+        fprintf(stderr,
+            "[validate] WARNING: mean output luma %.3f is very low — "
+            "image will appear too dark.\n", mean_out);
+        issues++;
+    }
+    if (mean_out > 0.70) {
+        fprintf(stderr,
+            "[validate] WARNING: mean output luma %.3f is very high — "
+            "image may appear washed out.\n", mean_out);
+        issues++;
+    }
+
+    /* ── Auto-adjust peak_nits if metadata is significantly overstated ── */
+    if (p999 > 1.0f && p999 < meta->peak_nits * 0.80f) {
+        float adjusted = p999 * 1.05f;   /* 5% headroom above p99.9 */
+        printf("[validate] Metadata peak = %.0f nits, but measured p99.9 = %.0f nits.\n",
+               (double)meta->peak_nits, (double)p999);
+        printf("[validate] Metadata overstates peak by %.0f%%. "
+               "Auto-adjusting to %.0f nits.\n",
+               100.0 * (meta->peak_nits - p999) / meta->peak_nits,
+               (double)adjusted);
+        meta->peak_nits = adjusted;
+        /* Also update max_cll to match if it was just following peak */
+        if (meta->max_cll > meta->peak_nits)
+            meta->max_cll = meta->peak_nits;
+        issues++;   /* counted so summary isn't "OK" */
+        printf("[validate] LUT will be regenerated with adjusted peak.\n\n");
+    }
+
+    if (issues == 0)
+        printf("[validate] ✓  LUT looks accurate — no significant issues found.\n\n");
+    else
+        printf("[validate] ⚠   %d issue(s) flagged above.\n\n", issues);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -366,7 +685,6 @@ static int write_cube(const char *outpath, int N, const HDRMeta *meta)
     FILE *f = fopen(outpath, "w");
     if (!f) { perror("fopen"); return -1; }
 
-    /* Header */
     fprintf(f, "# 3D LUT – HDR10 (BT.2020/PQ) → SDR (BT.709/sRGB)\n");
     fprintf(f, "# Generated by hdr10_to_sdr_lut\n");
     fprintf(f, "# Source peak : %.1f nits\n", (double)meta->peak_nits);
@@ -378,7 +696,6 @@ static int write_cube(const char *outpath, int N, const HDRMeta *meta)
 
     float step = 1.0f / (float)(N - 1);
 
-    /* Outer=B, middle=G, inner=R  (standard .cube order) */
     for (int bi = 0; bi < N; bi++) {
         for (int gi = 0; gi < N; gi++) {
             for (int ri = 0; ri < N; ri++) {
@@ -394,7 +711,6 @@ static int write_cube(const char *outpath, int N, const HDRMeta *meta)
                         (double)r_out, (double)g_out, (double)b_out);
             }
         }
-        /* Progress every 8 B slices */
         if ((bi & 7) == 0)
             printf("\r  progress: %3d / %d slices ...", bi + 1, N);
         fflush(stdout);
@@ -440,9 +756,15 @@ int main(int argc, char *argv[])
     printf("  output : %s\n", outfile);
     printf("═══════════════════════════════════════════\n");
 
+    /* Step 1: extract static HDR10 metadata */
     HDRMeta meta = {0};
     if (scan_video(infile, &meta) < 0) return 1;
-    if (write_cube(outfile, lut_size, &meta) < 0)  return 1;
+
+    /* Step 2: validate against real pixel data, auto-adjust if needed */
+    validate_and_adjust(infile, &meta);
+
+    /* Step 3: generate LUT with (possibly corrected) parameters */
+    if (write_cube(outfile, lut_size, &meta) < 0) return 1;
 
     printf("\n✓ Done.  Apply with:\n");
     printf("  ffmpeg -i \"%s\" \\\n", infile);
